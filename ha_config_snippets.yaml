@@ -1,0 +1,86 @@
+# ============================================================
+# Home Assistant configuration snippets
+# for SmartThings PAT auto-rotation
+# ============================================================
+# Add the input_text to your configuration.yaml (or a
+# dedicated helpers file if you use packages/split config).
+# ============================================================
+
+
+# ── 1.  input_text helper  ──────────────────────────────────
+# configuration.yaml (or helpers.yaml if you split it out)
+
+input_text:
+  smartthings_pat:
+    name: SmartThings PAT (live)
+    max: 64          # UUIDs are 36 chars; 64 gives comfortable headroom
+    mode: password   # hides the value in the Lovelace UI
+
+
+# ── 2.  shell_command  ─────────────────────────────────────
+# This is only needed if you want HA to be able to manually
+# trigger a rotation (e.g. from an automation or a button card).
+# The rotator container normally runs on its own cron schedule;
+# this is an optional "force rotate now" escape hatch.
+
+shell_command:
+  # Calls the rotator container's one-shot mode via docker exec.
+  # Adjust the container name if yours differs.
+  rotate_smartthings_pat: >
+    docker exec pat-rotator-pat-rotator-1 python pat_rotator.py
+
+
+# ── 3.  Automation: notify on rotation failure  ─────────────
+# The Docker container logs tell you if a rotation failed, but
+# this automation watches for the token entity going stale
+# (hasn't changed in > 23 hours) and sends a persistent
+# notification so you know before the current PAT expires.
+
+automation:
+  - alias: "SmartThings PAT: notify if stale"
+    id: smartthings_pat_stale_alert
+    description: >
+      Fire a persistent notification if the PAT hasn't been rotated
+      in over 23 hours (rotation is due every 20 h, so this gives a
+      1-3 h window before the PAT actually expires at 24 h).
+    trigger:
+      - platform: template
+        value_template: >
+          {{ (now().timestamp() -
+              as_timestamp(states.input_text.smartthings_pat.last_changed))
+             | int > 82800 }}
+        # 82800 s = 23 h
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "⚠️  SmartThings PAT stale"
+          message: >
+            The SmartThings PAT was last updated
+            {{ relative_time(states.input_text.smartthings_pat.last_changed) }} ago.
+            The fridge camera will stop working when it expires (24 h from creation).
+            Check the pat-rotator container logs.
+          notification_id: smartthings_pat_stale
+
+  - alias: "SmartThings PAT: clear notification on refresh"
+    id: smartthings_pat_stale_clear
+    description: >
+      Dismiss the stale-PAT notification automatically once a new
+      token arrives.
+    trigger:
+      - platform: state
+        entity_id: input_text.smartthings_pat
+    action:
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: smartthings_pat_stale
+
+
+# ── 4.  Optional: Lovelace button to force rotation  ────────
+# Add to your dashboard YAML if you want a manual-trigger card.
+
+# type: button
+# name: Rotate SmartThings PAT
+# icon: mdi:refresh
+# tap_action:
+#   action: call-service
+#   service: shell_command.rotate_smartthings_pat

@@ -1,0 +1,573 @@
+from __future__ import annotations
+from datetime import timedelta
+import logging
+import time
+from typing import TYPE_CHECKING
+
+from homeassistant.helpers.update_coordinator import (
+    DataUpdateCoordinator,
+)
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+import requests
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import async_track_state_change_event
+
+from .const import CID, DEFAULT_TIMEOUT
+
+if TYPE_CHECKING:
+    from homeassistant.helpers import config_entry_oauth2_flow
+
+_LOGGER = logging.getLogger(__name__)
+
+# Helper entity that the PAT rotator writes the new token to.
+_TOKEN_ENTITY = "input_text.smartthings_pat"
+
+
+class AuthenticationError(Exception):
+    """Raised when SmartThings API returns an authentication error (401/403)."""
+
+
+class DataCoordinator(DataUpdateCoordinator):
+    def __init__(self, hass: HomeAssistant, api: FamilyHub):
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="File ID refresher",
+            update_interval=timedelta(seconds=10),
+        )
+        self._hass = hass
+        self.api = api
+        self.last_file_ids = []
+        self.last_updated_at = None
+
+        # State change listener to dynamically reload the integration when the PAT changes.
+        # This recovers the integration from ConfigEntryAuthFailed states automatically.
+        def _handle_token_change(event):
+            new_state = event.data.get("new_state")
+            if new_state is None or new_state.state in ("unknown", "unavailable", ""):
+                return
+            new_token = new_state.state.strip()
+            if new_token and new_token != self.api.token:
+                _LOGGER.info(
+                    "Detected changed SmartThings PAT in %s. Updating config entry and reloading integration.",
+                    _TOKEN_ENTITY
+                )
+                self.api.update_token(new_token)
+
+                def _update_and_reload(e, t):
+                    new_data = {**e.data, "token": t}
+                    self._hass.config_entries.async_update_entry(e, data=new_data)
+                    self._hass.config_entries.async_schedule_reload(e.entry_id)
+
+                entries = self._hass.config_entries.async_entries("samsung_familyhub_fridge")
+                for entry in entries:
+                    self._hass.add_job(_update_and_reload, entry, new_token)
+
+        self._unsub_token_listener = async_track_state_change_event(
+            hass,
+            [_TOKEN_ENTITY],
+            _handle_token_change,
+        )
+
+        def _unsubscribe():
+            if hasattr(self, "_unsub_token_listener") and self._unsub_token_listener is not None:
+                self._unsub_token_listener()
+                self._unsub_token_listener = None
+
+        for entry in hass.config_entries.async_entries("samsung_familyhub_fridge"):
+            entry.async_on_unload(_unsubscribe)
+
+    async def _async_update_data(self):
+        """Fetch data from API endpoint."""
+        
+        # ── Dynamic Token Refresh & Persistence ────────────────────────────
+        # If input_text.smartthings_pat holds a valid non-empty value, we sync
+        # it into self.api.token and write it back to the config entry on disk.
+        # This keeps the integration functional without restarts and avoids
+        # "Re-authenticate" repair flows.
+        state = self._hass.states.get(_TOKEN_ENTITY)
+        if state and state.state not in ("unknown", "unavailable", ""):
+            live_token = state.state.strip()
+            if live_token and live_token != self.api.token:
+                _LOGGER.debug(
+                    "Picked up refreshed SmartThings PAT from %s", 
+                    _TOKEN_ENTITY
+                )
+                self.api.update_token(live_token)
+                
+                # Permanently update config entry data on disk so restarts sync cleanly
+                entries = self._hass.config_entries.async_entries("samsung_familyhub_fridge")
+                for entry in entries:
+                    if entry.data.get("token") != live_token:
+                        new_data = {**entry.data, "token": live_token}
+                        self._hass.config_entries.async_update_entry(entry, data=new_data)
+                        _LOGGER.info("Updated config entry on disk with new SmartThings PAT")
+        # ───────────────────────────────────────────────────────────────────
+
+        try:
+            # OAuth mode: refresh the access token (if close to expiry) BEFORE
+            # any API call. No-op for PAT mode.
+            await self.api.async_ensure_fresh_token()
+            if self.api.device_id is None:
+                _LOGGER.debug("No device_id — fetching device list")
+                status = await self._hass.async_add_executor_job(
+                    self.api.get_all_device_status
+                )
+                self.api.set_device_status(status)
+            if self.api.should_update:
+                _LOGGER.debug("should_update=True → sending refresh command to fridge")
+                await self._hass.async_add_executor_job(self.api.update_camera)
+                self.api.should_update = False
+            elif set(self.last_file_ids) != set(self.api.get_file_ids()):
+                new_ids = self.api.get_file_ids()
+                _LOGGER.debug(
+                    "file IDs changed: %s → %s, downloading images",
+                    self.last_file_ids,
+                    new_ids,
+                )
+                success = await self._hass.async_add_executor_job(
+                    self.api.download_images
+                )
+                if success:
+                    self.last_updated_at = time.time()
+                    self.last_file_ids = new_ids
+                else:
+                    _LOGGER.warning(
+                        "download_images returned no successes — will retry "
+                        "on next poll"
+                    )
+            else:
+                status = await self._hass.async_add_executor_job(
+                    self.api.get_current_device_status
+                )
+                self.api.set_current_device_status(status)
+                self.api.extract_device_data()
+                _LOGGER.debug(
+                    "polled status: last_closed=%s should_update=%s file_ids=%s",
+                    self.api.last_closed,
+                    self.api.should_update,
+                    self.api.get_file_ids(),
+                )
+        except AuthenticationError as err:
+            state = self._hass.states.get(_TOKEN_ENTITY)
+            if state is not None and state.state in ("unknown", "unavailable"):
+                _LOGGER.warning(
+                    "SmartThings auth failed, but helper entity %s is not ready yet (%s). "
+                    "Postponing setup...",
+                    _TOKEN_ENTITY,
+                    state.state,
+                )
+                raise ConfigEntryNotReady(
+                    f"Waiting for helper entity {_TOKEN_ENTITY} to restore state."
+                ) from err
+
+            raise ConfigEntryAuthFailed(
+                "SmartThings token expired or is invalid. "
+                "Please re-authenticate with a new token."
+            ) from err
+
+
+class FamilyHub:
+    """SmartThings Family Hub fridge API client.
+
+    Two auth modes:
+
+    1. PAT mode (default): caller provides a raw SmartThings token via
+       `token=`. Token is static; caller is responsible for refresh via
+       `update_token()`.
+
+    2. OAuth mode: after construction, caller attaches an
+       ``OAuth2Session`` via `attach_oauth_session(session)`. Before every
+       API call the coordinator awaits `async_ensure_fresh_token()` which
+       asks HA's OAuth2Session to refresh the access token if it's close
+       to expiry — no manual refresh needed.
+    """
+
+    def __init__(self, hass: HomeAssistant, token: str, device_id: str) -> None:
+        """Initialize."""
+        self._device_id = device_id
+        self._hass = hass
+        self.token = token
+        self._headers = {"Authorization": f"Bearer {self.token}"}
+        self.images = []
+        self._device_status = None
+        self._current_device_status = None
+        self.last_closed = None
+        self.should_update = False
+        self.downloaded_images = [None, None, None]
+        self._oauth_session: "config_entry_oauth2_flow.OAuth2Session | None" = None
+        # Samsung IoT token for client.smartthings.com image downloads.
+        # Only set in OAuth mode; PAT tokens already carry Samsung ID.
+        self._samsung_iot_token: str | None = None
+        self._samsung_iot_headers: dict | None = None
+        self._samsung_iot_refresh_token: str | None = None
+        self._samsung_iot_auth_server: str = "https://us-auth2.samsungosp.com"
+        self._entry = None
+
+    def set_samsung_iot_token(
+        self,
+        token: str,
+        refresh_token: str | None = None,
+        auth_server: str | None = None,
+        entry=None,
+    ) -> None:
+        """Set a Samsung IoT token for client.smartthings.com image downloads.
+
+        This token carries Samsung Account identity and is needed because
+        the udo/file_links endpoint rejects standard SmartThings OAuth tokens.
+        Optionally store a refresh_token, auth_server, and config entry so
+        download_images() can silently refresh the token on auth failures.
+        """
+        self._samsung_iot_token = token
+        self._samsung_iot_headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.smartthings+json;v=1",
+        }
+        if refresh_token is not None:
+            self._samsung_iot_refresh_token = refresh_token
+        if auth_server is not None:
+            self._samsung_iot_auth_server = auth_server
+        if entry is not None:
+            self._entry = entry
+
+    def _is_no_samsung_id_error(self, response: requests.Response) -> bool:
+        """Return True if response body contains 'No samsung id' (400 auth error)."""
+        try:
+            return "No samsung id" in response.text
+        except Exception:
+            return False
+
+    def _do_samsung_iot_refresh(self) -> None:
+        """Refresh the Samsung IoT token in-place and persist the new refresh token."""
+        from .auth import refresh_samsung_iot_token
+
+        try:
+            iot_creds = refresh_samsung_iot_token(
+                self._samsung_iot_refresh_token,
+                self._samsung_iot_auth_server,
+            )
+        except Exception as err:
+            raise AuthenticationError(
+                f"Samsung IoT token refresh failed: {err}"
+            ) from err
+
+        self.set_samsung_iot_token(
+            iot_creds.access_token,
+            refresh_token=iot_creds.refresh_token,
+            auth_server=self._samsung_iot_auth_server,
+            entry=self._entry,
+        )
+
+        if self._entry is not None:
+            from .const import CONF_SAMSUNG_IOT_REFRESH_TOKEN
+            new_data = {
+                **self._entry.data,
+                CONF_SAMSUNG_IOT_REFRESH_TOKEN: iot_creds.refresh_token,
+            }
+            self._hass.config_entries.async_update_entry(self._entry, data=new_data)
+
+    def attach_oauth_session(
+        self, session: "config_entry_oauth2_flow.OAuth2Session"
+    ) -> None:
+        """Bind an HA OAuth2Session so tokens refresh automatically.
+
+        Once attached, `async_ensure_fresh_token()` consults this session
+        before every API call and updates the bearer header in place.
+        """
+        self._oauth_session = session
+
+    async def async_ensure_fresh_token(self) -> None:
+        """If running in OAuth mode, ensure the bearer token is still valid.
+
+        No-op for PAT mode. Safe to call on every poll — HA's OAuth2Session
+        only performs a network refresh when the access_token is within
+        a few seconds of expiring.
+        """
+        if self._oauth_session is None:
+            return
+        await self._oauth_session.async_ensure_token_valid()
+        new_token = self._oauth_session.token.get("access_token")
+        if new_token and new_token != self.token:
+            self.update_token(new_token)
+
+    def update_token(self, token: str) -> None:
+        """Update the API token (used after re-authentication or OAuth refresh)."""
+        self.token = token
+        self._headers = {"Authorization": f"Bearer {self.token}"}
+
+    @property
+    def device_id(self):
+        if not self._device_id:
+            self.set_device_id()
+        return self._device_id
+
+    def _check_response(self, response: requests.Response) -> None:
+        """Check HTTP response for auth errors and raise accordingly."""
+        if response.status_code in (401, 403):
+            _LOGGER.error(
+                "SmartThings authentication failed (HTTP %s). "
+                "Token may have expired — SmartThings personal access tokens "
+                "expire after 24 hours",
+                response.status_code,
+            )
+            raise AuthenticationError(
+                f"SmartThings API returned HTTP {response.status_code}. "
+                "Token is expired or invalid."
+            )
+        if response.status_code == 400:
+            try:
+                body = response.json()
+                err = body.get("error", {})
+                if (
+                    err.get("code") == "BadRequestError"
+                    and "No samsung id" in err.get("message", "")
+                ):
+                    raise AuthenticationError(
+                        "No samsung id available — switch to Standalone OAuth or add "
+                        "Samsung Account credentials"
+                    )
+            except AuthenticationError:
+                raise
+            except Exception:
+                pass
+        if not response.ok:
+            _LOGGER.warning(
+                "SmartThings API request failed: HTTP %s - %s",
+                response.status_code,
+                response.text[:200],
+            )
+
+    async def authenticate(self) -> bool:
+        """Test if we can authenticate with the host."""
+        await self._hass.async_add_executor_job(self.get_all_device_status)
+        return True
+
+    def set_device_status(self, status):
+        self._device_status = status
+
+    def set_current_device_status(self, status):
+        self._current_device_status = status
+
+    def download_images(self) -> bool:
+        """Download the actual camera images from SmartThings.
+
+        Returns True if at least one image was downloaded successfully.
+        Failed individual downloads preserve the previously-known image,
+        so a transient network error on one image doesn't wipe the others.
+        """
+        if not self._current_device_status or not self.device_id:
+            return False
+
+        file_ids = self.get_file_ids()
+        # Start from the existing images so a partial failure doesn't wipe
+        # slots that we can't refresh this cycle.
+        result = list(self.downloaded_images)
+        while len(result) < len(file_ids):
+            result.append(None)
+
+        successes = 0
+        for idx, file_id in enumerate(file_ids):
+            try:
+                url = (
+                    f"https://client.smartthings.com/udo/file_links/"
+                    f"{file_id}?cid={CID}&di={self.device_id}"
+                )
+                # Use Samsung IoT token if available (OAuth mode);
+                # otherwise use the main token (PAT mode).
+                dl_headers = (
+                    self._samsung_iot_headers
+                    if self._samsung_iot_headers
+                    else self._headers
+                )
+                r = requests.get(
+                    url,
+                    headers=dl_headers,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+                # Samsung IoT in-session refresh: when using IoT headers and the
+                # server returns 401/403 or a 400 'No samsung id' error, attempt
+                # a silent token refresh and retry once before surfacing as
+                # ConfigEntryAuthFailed.
+                if dl_headers is self._samsung_iot_headers:
+                    auth_fail = r.status_code in (401, 403) or (
+                        r.status_code == 400 and self._is_no_samsung_id_error(r)
+                    )
+                    if auth_fail:
+                        if not self._samsung_iot_refresh_token:
+                            raise AuthenticationError(
+                                f"Samsung IoT authentication failed "
+                                f"(HTTP {r.status_code}) — no refresh token available."
+                            )
+                        self._do_samsung_iot_refresh()
+                        r = requests.get(
+                            url,
+                            headers=self._samsung_iot_headers,
+                            timeout=DEFAULT_TIMEOUT,
+                        )
+                self._check_response(r)
+                content_type = r.headers.get("content-type", "")
+                _LOGGER.debug(
+                    "download_images[%d]: file_id=%s url=%s status=%s "
+                    "content_type=%s length=%d",
+                    idx,
+                    file_id[:8],
+                    url.split("?")[0][-40:],
+                    r.status_code,
+                    content_type,
+                    len(r.content),
+                )
+                result[idx] = r.content
+                successes += 1
+            except AuthenticationError:
+                # Auth errors must propagate up so the coordinator can
+                # trigger reauth — do not swallow.
+                raise
+            except Exception as err:
+                _LOGGER.warning(
+                    "download_images[%d]: failed to download file_id=%s: %s",
+                    idx,
+                    file_id[:8],
+                    err,
+                )
+                # Keep the previous bytes for this slot (don't overwrite with None)
+
+        self.downloaded_images = result
+        _LOGGER.debug(
+            "download_images: stored %d/%d images, sizes=%s",
+            successes,
+            len(file_ids),
+            [len(i) if i else 0 for i in result],
+        )
+        return successes > 0
+
+    def get_all_device_status(self):
+        """Get all of the devices in the account."""
+        r = requests.get(
+            "https://client.smartthings.com/devices/status",
+            headers=self._headers,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self._check_response(r)
+        data = r.json()
+        if isinstance(data, dict) and "error" in data:
+            _LOGGER.error(
+                "SmartThings API returned error: %s", data["error"]
+            )
+        return data
+
+    def get_current_device_status(self):
+        """Get the current device status."""
+        r = requests.get(
+            f"https://api.smartthings.com/v1/devices/{self.device_id}/components/main/status",
+            headers=self._headers,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self._check_response(r)
+        data = r.json()
+        if isinstance(data, dict) and "error" in data:
+            _LOGGER.error(
+                "SmartThings device status returned error: %s", data["error"]
+            )
+        return data
+
+    def extract_device_data(self):
+        """Extract contact sensor data to detect door close events."""
+        if not self._current_device_status:
+            return
+        try:
+            contact = self._current_device_status["contactSensor"]["contact"]
+        except KeyError:
+            _LOGGER.debug(
+                "contactSensor data not available in device status"
+            )
+            return
+        _LOGGER.debug(
+            "contactSensor: value=%s timestamp=%s (last_closed=%s)",
+            contact.get("value"),
+            contact.get("timestamp"),
+            self.last_closed,
+        )
+        # Trigger a refresh on first poll after startup, so users see fresh
+        # images without having to physically open and close the fridge door.
+        first_poll = self.last_closed is None
+        if contact["value"] == "closed" and (
+            first_poll or contact["timestamp"] != self.last_closed
+        ):
+            self.last_closed = contact["timestamp"]
+            self.should_update = True
+            if first_poll:
+                _LOGGER.debug("First poll after startup — requesting camera refresh")
+
+    def get_file_ids(self):
+        """Get the file IDs for the camera images."""
+        if not self._current_device_status:
+            return []
+        try:
+            element = self._current_device_status["samsungce.viewInside"]["contents"]
+            return [i["fileId"] for i in element["value"]]
+        except (KeyError, TypeError):
+            _LOGGER.debug(
+                "samsungce.viewInside data not available in device status"
+            )
+            return []
+
+    def set_device_id(self):
+        """Extract device ID from the device status list."""
+        if not self._device_status:
+            return
+        try:
+            items = self._device_status["items"]
+        except (KeyError, TypeError):
+            _LOGGER.error(
+                "Unexpected device status format — missing 'items' key. "
+                "This may indicate an expired token or API error. "
+                "Response: %s",
+                str(self._device_status)[:200],
+            )
+            return
+        for element in items:
+            if (
+                element.get("capabilityId") == "samsungce.viewInside"
+                and element.get("attributeName") == "contents"
+            ):
+                self._device_id = element["deviceId"]
+                break
+
+    def update_camera(self):
+        """Send the reverse-engineered refresh command to the fridge.
+
+        Uses the single OCF resource at /udo/contents/provider/vs/0 which
+        contains all three camera images. Throttled by the coordinator via
+        contactSensor door-close events.
+        """
+        if not self.device_id:
+            return
+        r = requests.post(
+            f"https://api.smartthings.com/v1/devices/{self.device_id}/commands",
+            headers=self._headers,
+            json={
+                "commands": [
+                    {
+                        "component": "main",
+                        "capability": "execute",
+                        "command": "execute",
+                        "arguments": [
+                            "/udo/contents/provider/vs/0",
+                            {
+                                "x.com.samsung.da.control": {
+                                    "x.com.samsung.da.command": "refresh"
+                                }
+                            },
+                        ],
+                    }
+                ]
+            },
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self._check_response(r)
+        _LOGGER.debug(
+            "update_camera: status=%s body=%s",
+            r.status_code,
+            r.text[:300],
+        )

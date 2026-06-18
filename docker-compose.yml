@@ -1,0 +1,49 @@
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # SmartThings PAT Rotator
+  #
+  # Runs once every 20 hours via supercronic, generates a fresh PAT via
+  # Playwright, and pushes it to an HA input_text entity via the REST API.
+  #
+  # First-time setup:
+  #   1. Copy .env.example → .env and fill in your values
+  #   2. docker compose run --rm pat-rotator python pat_rotator.py --debug
+  #      (runs non-headless — useful only on a machine with a display;
+  #       for truly headless first runs just start normally and check logs)
+  #   3. docker compose up -d
+  # ─────────────────────────────────────────────────────────────────────────
+
+  pat-rotator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pat-rotator:local
+
+    # supercronic gives us cron inside a container without cron daemon headaches
+    command: >
+      sh -c "
+        echo '0 */20 * * * python /app/pat_rotator.py' > /tmp/crontab &&
+        echo '*/30 * * * * python /app/pat_rotator.py --keep-alive' >> /tmp/crontab &&
+        supercronic /tmp/crontab
+      "
+
+    env_file:
+      - .env
+
+    volumes:
+      # Persists browser state (cookies) between runs so Samsung doesn't ask
+      # you to log in every time
+      - ./data:/data
+
+    restart: unless-stopped
+
+    # Playwright / Chromium needs a real /dev/shm; the default 64 MB is too small
+    shm_size: "256mb"
+
+    # Logging — keep it compact
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"

@@ -1,0 +1,24 @@
+# Environment variables (contains credentials/secrets)
+.env
+
+# Local data directory (persists browser session state, cookies, and debug screenshots)
+data/
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Screenshots & logs
+*screenshot*.png
+2fa_page_screenshot.png
+*.log
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Systemd service unit (contains local paths/username)
+pat-rotator.service
