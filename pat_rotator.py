@@ -46,6 +46,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("pat_rotator")
 
+# net::ERR_NETWORK_CHANGED (interface/route changed mid-request) is a
+# transient OS-level network condition, not a page/selector problem -
+# retrying the same navigation almost always succeeds a few seconds later.
+NETWORK_CHANGED_RETRY_ATTEMPTS = 3
+NETWORK_CHANGED_RETRY_DELAY_SECONDS = 5
+
+
+async def goto_with_retry(page, url: str, **kwargs) -> None:
+    """page.goto() that retries on a transient network-changed error."""
+    for attempt in range(1, NETWORK_CHANGED_RETRY_ATTEMPTS + 1):
+        try:
+            await page.goto(url, **kwargs)
+            return
+        except Exception as e:
+            if "ERR_NETWORK_CHANGED" not in str(e) or attempt == NETWORK_CHANGED_RETRY_ATTEMPTS:
+                raise
+            log.warning(
+                "Network changed navigating to %s (attempt %s/%s) - retrying in %ss",
+                url, attempt, NETWORK_CHANGED_RETRY_ATTEMPTS, NETWORK_CHANGED_RETRY_DELAY_SECONDS,
+            )
+            await asyncio.sleep(NETWORK_CHANGED_RETRY_DELAY_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # Login helpers
 # ---------------------------------------------------------------------------
@@ -184,6 +207,11 @@ async def generate_new_pat(page) -> tuple[str, str]:
     """Click 'Generate new token', fill in the form, and return the raw token string and its label."""
 
     # --- Find the Generate button ---
+    # The tokens page can still be rendering its token list (a loading
+    # spinner) when we arrive - page.goto()'s "networkidle" only means no
+    # network activity, not that the SPA has finished its own client-side
+    # render. 5s per selector wasn't enough on a slow render; 15s costs
+    # nothing against a 20h rotation cadence.
     gen_btn = None
     for sel in [
         "button:has-text('Generate new token')",
@@ -192,7 +220,7 @@ async def generate_new_pat(page) -> tuple[str, str]:
         "button:has-text('New token')",
     ]:
         try:
-            await page.wait_for_selector(sel, timeout=5_000)
+            await page.wait_for_selector(sel, timeout=15_000)
             gen_btn = page.locator(sel).first
             if await gen_btn.is_visible():
                 break
@@ -610,13 +638,13 @@ async def run_browser(debug: bool = False) -> str:
 
         try:
             log.info(f"Navigating to {PAT_PAGE_URL}")
-            await page.goto(PAT_PAGE_URL, wait_until="networkidle", timeout=30_000)
+            await goto_with_retry(page, PAT_PAGE_URL, wait_until="networkidle", timeout=30_000)
             log.info(f"Landed at: {page.url}")
 
             # If we were redirected to a login page, authenticate first
             if "account.smartthings.com/tokens" not in page.url:
                 await do_login(page)
-                await page.goto(PAT_PAGE_URL, wait_until="networkidle", timeout=20_000)
+                await goto_with_retry(page, PAT_PAGE_URL, wait_until="networkidle", timeout=20_000)
 
             token, pat_label = await generate_new_pat(page)
 
