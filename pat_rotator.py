@@ -46,6 +46,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("pat_rotator")
 
+
+def safe_url(url: str) -> str:
+    """URL without its query string, for logging: SSO redirects carry auth codes and state there."""
+    return url.split("?", 1)[0]
+
 # net::ERR_NETWORK_CHANGED (interface/route changed mid-request) is a
 # transient OS-level network condition, not a page/selector problem -
 # retrying the same navigation almost always succeeds a few seconds later.
@@ -84,8 +89,8 @@ async def goto_with_retry(page, url: str, **kwargs) -> None:
         if page.url.startswith("chrome-error://"):
             if last_attempt:
                 raise RuntimeError(
-                    f"Navigation to {url} landed on a browser error page "
-                    f"({page.url}) after {NETWORK_CHANGED_RETRY_ATTEMPTS} attempts"
+                    f"Navigation to {safe_url(url)} landed on a browser error page "
+                    f"({safe_url(page.url)}) after {NETWORK_CHANGED_RETRY_ATTEMPTS} attempts"
                 )
             log.warning(
                 "Landed on a browser error page (%s) navigating to %s "
@@ -222,7 +227,7 @@ async def _handle_totp(page) -> None:
             code = pyotp.TOTP(SAMSUNG_TOTP_SECRET).now()
             field = await page.query_selector(active_sel)
             await field.fill(code)
-            log.info(f"Entered TOTP code {code} into {active_sel}")
+            log.info(f"Entered TOTP code into {active_sel}")
             await field.press("Enter")
             await page.wait_for_timeout(3_000)
         except Exception as e:
@@ -275,17 +280,14 @@ async def generate_new_pat(page) -> tuple[str, str]:
     except Exception as e:
         log.warning(f"Timeout waiting for checkboxes to appear: {e}")
         try:
-            body_html = await page.content()
-            log.info(f"Page HTML content (first 3000 chars): {body_html[:3000]}")
             inputs = await page.query_selector_all("input")
             log.info(f"Page has {len(inputs)} input elements:")
             for idx, inp in enumerate(inputs):
                 typ = await inp.get_attribute("type")
                 name = await inp.get_attribute("name")
-                val = await inp.get_attribute("value")
-                log.info(f"  [{idx}] type={typ} name={name} value={val}")
+                log.info(f"  [{idx}] type={typ} name={name}")
         except Exception as html_err:
-            log.warning(f"Failed to dump page HTML: {html_err}")
+            log.warning(f"Failed to list page inputs: {html_err}")
 
     # --- Token name ---
     name_input = None
@@ -361,7 +363,7 @@ async def generate_new_pat(page) -> tuple[str, str]:
             f"Screenshot saved to {screenshot_path}"
         )
 
-    log.info(f"Successfully captured PAT: {token[:8]}…")
+    log.info("Successfully captured PAT")
     return token, pat_label
 
 
@@ -646,18 +648,11 @@ async def run_browser(debug: bool = False) -> str:
         page = await context.new_page()
 
         # Log browser console and network failures
-        page.on("console", lambda msg: log.info(f"BROWSER CONSOLE: {msg.text}"))
+        page.on("console", lambda msg: log.debug(f"BROWSER CONSOLE: {msg.text}"))
         page.on("pageerror", lambda err: log.error(f"BROWSER ERROR: {err}"))
-        page.on("requestfailed", lambda req: log.warning(f"BROWSER REQ FAILED: {req.url} - {req.failure if req.failure else 'unknown'}"))
-        async def handle_response(resp):
-            try:
-                log.info(f"BROWSER RESP: {resp.status} {resp.url}")
-                if "token-options" in resp.url or "tokens" in resp.url:
-                    text = await resp.text()
-                    log.info(f"API BODY [{resp.url}]: {text[:2000]}")
-            except Exception as e:
-                log.debug(f"Failed to read response body for {resp.url}: {e}")
-        page.on("response", lambda resp: asyncio.create_task(handle_response(resp)))
+        page.on("requestfailed", lambda req: log.warning(f"BROWSER REQ FAILED: {safe_url(req.url)} - {req.failure if req.failure else 'unknown'}"))
+        # Status and URL only: the tokens API bodies list every token's authKey.
+        page.on("response", lambda resp: log.info(f"BROWSER RESP: {resp.status} {safe_url(resp.url)}"))
 
         # Register dialog listener to auto-accept confirmation dialogs
         async def handle_dialog(dialog):
@@ -668,7 +663,7 @@ async def run_browser(debug: bool = False) -> str:
         try:
             log.info(f"Navigating to {PAT_PAGE_URL}")
             await goto_with_retry(page, PAT_PAGE_URL, wait_until="networkidle", timeout=30_000)
-            log.info(f"Landed at: {page.url}")
+            log.info(f"Landed at: {safe_url(page.url)}")
 
             # If we were redirected to a login page, authenticate first
             if "account.smartthings.com/tokens" not in page.url:
@@ -800,7 +795,7 @@ async def run_keep_alive() -> bool:
                 log.info("Session is active. Successfully updated browser state.")
                 return True
             else:
-                log.warning(f"Session expired or redirected to: {page.url}")
+                log.warning(f"Session expired or redirected to: {safe_url(page.url)}")
                 return False
         except Exception as e:
             log.error(f"Keep-alive failed: {e}")
